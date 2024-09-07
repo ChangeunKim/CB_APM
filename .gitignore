@@ -1,0 +1,30 @@
+
+*pyc
+*pth
+.conda
+.vscode/
+checkpoints/
+.DS_Store
+.git/
+__pycache__/
+
+# Data
+data/
+*.csv
+
+# sbatch files
+bash/
+*.sh
+
+# Output files
+error/
+output/
+results/
+results_ensemble_1/
+results_ensemble_2/
+results_ensemble_10/
+tables/
+
+# Test files
+data_test.ipynb
+module_test.ipynb
