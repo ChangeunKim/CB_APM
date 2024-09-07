@@ -1,0 +1,33 @@
+# CB-APM: Consensus-Bottleneck Asset Pricing Model
+# Requirements file for package dependencies
+
+# Core Deep Learning
+torch>=1.12.0
+
+# Data Processing & Analysis
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Machine Learning & Benchmarks
+scikit-learn>=1.0.0
+
+# Hyperparameter Optimization
+optuna>=3.0.0
+
+# Progress Bars
+tqdm>=4.62.0
+
+# Model Persistence
+joblib>=1.1.0
+
+# Visualization (for analysis notebooks)
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Jupyter Notebooks (for analysis)
+jupyter>=1.0.0
+notebook>=6.4.0
+ipykernel>=6.0.0
+
+# Optional: GPU acceleration
+# Install appropriate CUDA version from https://pytorch.org/
