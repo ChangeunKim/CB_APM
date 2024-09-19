@@ -127,7 +127,8 @@ def fill_firm_na(firm_predictors, firm_info, method):
         firm_col = firm_predictors.columns[~firm_predictors.columns.isin(analyst_col)]
 
         firm_predictors_firm = firm_predictors[firm_col].groupby('date').apply(lambda x: x.fillna(x.mean()))
-        firm_predictors_firm.index = firm_predictors_firm.index.droplevel()
+        if isinstance(firm_predictors_firm.index, pd.MultiIndex):
+            firm_predictors_firm.index = firm_predictors_firm.index.droplevel()
         firm_predictors_firm = firm_predictors_firm.sort_index()
 
         firm_predictors_analyst = firm_predictors[analyst_col]
@@ -143,7 +144,8 @@ def rank_norm(firm_predictors):
     firm_predictors_index = firm_predictors[index]
 
     firm_predictors_firm = firm_predictors.groupby('date').apply(lambda x: x.drop(index, axis=1).rank(pct=True) * 2 - 1)
-    firm_predictors_firm.index = firm_predictors_firm.index.droplevel()
+    if isinstance(firm_predictors_firm.index, pd.MultiIndex):
+        firm_predictors_firm.index = firm_predictors_firm.index.droplevel()
     firm_predictors_firm = firm_predictors_firm.sort_index()
 
     firm_predictors = pd.concat([firm_predictors_index, firm_predictors_firm], axis = 1)
