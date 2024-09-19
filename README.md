@@ -7,7 +7,7 @@ This repository contains code implementation of Master's Thesis titled "*A Conse
 
 Dataset used in this work is mainly sourced from WRDS and cannot be accessed without a subscription. However, you can download the dataset we used to train CB_APM from the Google Drive link below. Please contact us by email to request permission to access the shared link.
 
-Data link: https://drive.google.com/drive/folders/1DwvaKnuB2rDdzminh9mYmzcHd-zk8lBn?usp=drive_link
+Data link: https://drive.google.com/drive/folders/1ff_VxjDY0O3sZwSY7uQEMR9veXlDeb4C?usp=drive_link
 
 For a detailed list of the variables used in the study, please refer to the appendix of our paper. We highly recommend fully understanding the dataset before conducting further research.
 
