@@ -29,5 +29,13 @@ jupyter>=1.0.0
 notebook>=6.4.0
 ipykernel>=6.0.0
 
+# Panel regressions (analysis/coefficient_analysis.py)
+linearmodels>=4.25
+
+# Optional: for reading/writing .xlsx tables (analysis/r_squared_analysis.py,
+# analysis/util.py::get_best_lambda_from_summary); falls back to per-sheet
+# csv output if not installed.
+openpyxl>=3.0
+
 # Optional: GPU acceleration
 # Install appropriate CUDA version from https://pytorch.org/

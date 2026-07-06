@@ -18,11 +18,19 @@ bash/
 # Output files
 error/
 output/
+outputs/
+experiments/
 results/
 checkpoints/
 tables/
 *.pt
 *.pickle
+*.png
+*.jpg
+*.txt
+!requirements.txt
+*.csv.gz
+*.zip
 
 # Test files
 data_test.ipynb

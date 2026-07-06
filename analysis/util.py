@@ -15,8 +15,270 @@ from utils.data_utils import create_dataloaders
 from models.networks import ConceptBottleneckModel
 from models.test import test
 
-def get_best_lambda_from_summary(horizon):
-    summary_path = f'../tables/{horizon}_r2_analysis_summary.xlsx'
+import pickle
+from pathlib import Path
+
+# Repo root, resolved from this file's location so callers can run scripts from
+# anywhere (repo root or analysis/) without depending on cwd.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Canonical order of the 9 analyst consensus variables (matches SignalDoc.csv
+# 'Acronym' order for rows with Cat.Data == 'Analyst' that appear in the model
+# inputs; see REVISION_PLAN_CLAUDE_CODE.md Section 1, G7).
+CONSENSUS_VARS = [
+    'AnalystRevision', 'ChangeInRecommendation', 'ChForecastAccrual',
+    'EarningsForecastDisparity', 'FEPS', 'ForecastDispersion',
+    'REV6', 'AnalystValue', 'AOP',
+]
+
+
+def load_final_result_pickle(horizon, weight_lambda, results_dir=None):
+    """
+    Load a results/<horizon>_<weight_lambda>.pickle produced by run.py and
+    attach readable column names (date, permno, <CONSENSUS_VARS...> / Return).
+
+    Parameters
+    ----------
+    horizon : str, e.g. '12month'
+    weight_lambda : float
+    results_dir : str or Path, default REPO_ROOT / 'final_results'
+
+    Returns
+    -------
+    dict with keys 'actual_concept', 'forecast_concept', 'actual_target',
+    'forecast_target', each a DataFrame with named columns.
+    """
+    if results_dir is None:
+        results_dir = REPO_ROOT / 'final_results'
+    results_dir = Path(results_dir)
+
+    file_name = f'{horizon}_{weight_lambda}.pickle'
+    with open(results_dir / file_name, 'rb') as f:
+        raw = pickle.load(f)
+
+    out = {}
+    for key in ('actual_concept', 'forecast_concept'):
+        df = raw[key].copy()
+        df.columns = ['date', 'permno'] + CONSENSUS_VARS
+        df['date'] = pd.to_datetime(df['date'])
+        out[key] = df
+    for key in ('actual_target', 'forecast_target'):
+        df = raw[key].copy()
+        df.columns = ['date', 'permno', 'Return']
+        df['date'] = pd.to_datetime(df['date'])
+        out[key] = df
+    return out
+
+
+def build_tidy_frame(horizon, weight_lambda, results_dir=None):
+    """
+    Merge a loaded result pickle into one tidy long DataFrame indexed by
+    [date, permno] with columns:
+        C_<var>    raw consensus (actual_concept)
+        MIC_<var>  machine-implied consensus (forecast_concept)
+        y_true     realized (excess) return
+        y_pred     CB-framework predicted return
+    """
+    raw = load_final_result_pickle(horizon, weight_lambda, results_dir=results_dir)
+
+    actual_c = raw['actual_concept'].rename(columns={v: f'C_{v}' for v in CONSENSUS_VARS})
+    forecast_c = raw['forecast_concept'].rename(columns={v: f'MIC_{v}' for v in CONSENSUS_VARS})
+    actual_t = raw['actual_target'].rename(columns={'Return': 'y_true'})
+    forecast_t = raw['forecast_target'].rename(columns={'Return': 'y_pred'})
+
+    df = actual_c.merge(forecast_c, on=['date', 'permno'], how='inner')
+    df = df.merge(actual_t, on=['date', 'permno'], how='inner')
+    df = df.merge(forecast_t, on=['date', 'permno'], how='inner')
+    return df
+
+
+def portfolio_weights(df, weight_col=None, group_col='date'):
+    """
+    Build positive portfolio weights that sum to 1 within each date group.
+
+    weight_col=None gives equal weighting. weight_col='Size' gives TRUE
+    value-weighting: data/input_<h>month.csv's 'Size' column is log market
+    equity (raw, pre rank-normalization -- confirmed by its continuous range
+    [~7, ~19], not the [-1, 1] rank-normalized scale used for model inputs),
+    so exp(Size) is proportional to ME and exp(Size)-weighting is standard
+    VW, not an approximation. For any other weight_col, exp(x) is used as a
+    generic positive-weight transform -- treat non-Size weight columns as a
+    documented proxy unless you have separately confirmed they are on a raw
+    (not rank-normalized) scale.
+    """
+    if weight_col is None:
+        w = pd.Series(1.0, index=df.index)
+    else:
+        w = np.exp(df[weight_col].astype(float))
+    w = w.groupby(df[group_col]).transform(lambda x: x / x.sum())
+    return w
+
+
+def decile_sort_returns(df, signal_col, return_col='y_true', date_col='date',
+                         n_bins=10, weight_col=None, min_names=10):
+    """
+    Shared single-sort decile (or n_bins) portfolio construction (REVISION_PLAN
+    G6): cross-sectional bins on `signal_col` each date, weighted mean of
+    `return_col` per bin, monthly rebalance. See `portfolio_weights` for the
+    VW-proxy caveat.
+
+    Returns
+    -------
+    panel : DataFrame, index=date, columns=1..n_bins (+ 'H-L'), monthly bin
+            returns (wide format, ready for newey_west_tstat / decile means).
+    summary : DataFrame, one row per bin (+ H-L), columns ['mean','se','tstat','pval','nobs']
+    """
+    from analysis.stats_utils import newey_west_tstat
+
+    work = df[[date_col, signal_col, return_col] + ([weight_col] if weight_col else [])].dropna()
+    work['_w'] = portfolio_weights(work, weight_col=weight_col, group_col=date_col)
+
+    def _bin(x):
+        try:
+            return pd.qcut(x, n_bins, labels=False, duplicates='drop') + 1
+        except ValueError:
+            return pd.Series(np.nan, index=x.index)
+
+    work['_bin'] = work.groupby(date_col)[signal_col].transform(_bin)
+    work = work.dropna(subset=['_bin'])
+
+    counts = work.groupby(date_col)['_bin'].transform('count')
+    work = work[counts >= min_names]
+
+    def _wmean(g):
+        return np.average(g[return_col], weights=g['_w'])
+
+    panel = (
+        work.groupby([date_col, '_bin'])
+        .apply(_wmean, include_groups=False)
+        .unstack('_bin')
+    )
+    panel.columns = [int(c) for c in panel.columns]
+    panel = panel.reindex(columns=sorted(panel.columns))
+    if panel.shape[1] == n_bins:
+        panel['H-L'] = panel[panel.columns[-1]] - panel[panel.columns[0]]
+
+    summary_rows = {}
+    for col in panel.columns:
+        summary_rows[col] = newey_west_tstat(panel[col].dropna())
+    summary = pd.DataFrame(summary_rows).T
+    summary.index.name = 'bin'
+    return panel, summary
+
+
+def load_size_and_exchcd(horizon, data_dir=None):
+    """
+    Size (raw log market equity, see portfolio_weights) from
+    data/input_<horizon>.csv, merged with exchcd (NYSE flag = 1) from
+    data/raw/IBES_summary.csv, aligned to month-start dates.
+    """
+    if data_dir is None:
+        data_dir = REPO_ROOT / 'data'
+    data_dir = Path(data_dir)
+
+    size = pd.read_csv(data_dir / f'input_{horizon}.csv', usecols=['permno', 'date', 'Size'])
+    size['date'] = pd.to_datetime(size['date']).values.astype('datetime64[M]')
+
+    ibes = pd.read_csv(data_dir / 'raw' / 'IBES_summary.csv', usecols=['permno', 'date', 'exchcd'])
+    ibes['date'] = pd.to_datetime(ibes['date']).values.astype('datetime64[M]')
+    ibes = ibes.drop_duplicates(['permno', 'date'])
+
+    return size.merge(ibes, on=['permno', 'date'], how='left')
+
+
+def nyse_breakpoint_mask(df, size_col='Size', exchcd_col='exchcd', date_col='date', pct=0.2):
+    """
+    Boolean mask: True where a firm-month's Size is AT OR ABOVE the pct-th
+    percentile of Size among NYSE (exchcd==1) firms that month (standard
+    Fama-French microcap-exclusion breakpoint). Firms with missing exchcd are
+    still evaluated against the NYSE breakpoint from firms that do have it.
+    """
+    nyse_bp = (
+        df.loc[df[exchcd_col] == 1]
+        .groupby(date_col)[size_col]
+        .quantile(pct)
+        .rename('_nyse_bp')
+    )
+    merged = df.join(nyse_bp, on=date_col)
+    return merged[size_col] >= merged['_nyse_bp']
+
+
+def real_cost_net_hl_returns(df, signal_col, return_col='y_true', date_col='date',
+                              permno_col='permno', n_bins=10, cost_rate=0.005, weight_col='Size'):
+    """
+    D.5.3's ACTUAL cost model (extracted from analysis/portfolio.ipynb's
+    plot_portfolio_performance/calculate_portfolio_metrics, which were only
+    inline in the notebook, not importable): net_r_t = gross_r_t -
+    transaction_cost * turnover_t, where turnover_t is the realized
+    period-over-period portfolio turnover of the LONG-SHORT (top-decile long,
+    bottom-decile short) weight vector (reuses this module's own `turnover`
+    function, not a flat assumption). `cost_rate` is per unit of turnover
+    (e.g. 0.005 = 50bps, matching the notebook's own worked examples of
+    0.0025/0.005/0.0075).
+
+    Returns
+    -------
+    dict with 'gross_hl' (Series indexed by date), 'net_hl' (Series indexed
+    by date, first period unadjusted -- no prior weights to compute turnover
+    against), 'turnover_by_date' (Series)
+    """
+    work = df[[date_col, permno_col, signal_col, return_col] + ([weight_col] if weight_col else [])].dropna()
+    work['_w'] = portfolio_weights(work, weight_col=weight_col, group_col=date_col)
+
+    def _bin(x):
+        try:
+            return pd.qcut(x, n_bins, labels=False, duplicates='drop') + 1
+        except ValueError:
+            return pd.Series(np.nan, index=x.index)
+
+    work['_bin'] = work.groupby(date_col)[signal_col].transform(_bin)
+    top, bot = work['_bin'].max(), work['_bin'].min()
+
+    long_leg = work[work['_bin'] == top].copy()
+    short_leg = work[work['_bin'] == bot].copy()
+    long_leg['_leg_w'] = long_leg.groupby(date_col)['_w'].transform(lambda x: x / x.sum())
+    short_leg['_leg_w'] = -short_leg.groupby(date_col)['_w'].transform(lambda x: x / x.sum())
+
+    combined = pd.concat([long_leg, short_leg], ignore_index=True)
+    weights_df = combined[[date_col, permno_col, '_leg_w']].rename(columns={'_leg_w': 'weight'}).set_index(date_col)
+    returns_df = combined[[date_col, permno_col, return_col]].rename(columns={return_col: 'actual'}).set_index(date_col)
+    # turnover() expects arithmetic returns; return_col here (y_true) is a
+    # log/simple annual return depending on the caller -- convert defensively
+    # only if values look like log returns (can be negative below -1); the
+    # existing repo convention (see analysis/decision_value.py) already
+    # treats y_true as usable directly with turnover(), so no conversion here.
+
+    gross_hl = (long_leg.groupby(date_col)[return_col].apply(lambda x: np.average(x, weights=long_leg.loc[x.index, '_w'] / long_leg.loc[x.index, '_w'].sum()))
+                - short_leg.groupby(date_col)[return_col].apply(lambda x: np.average(x, weights=short_leg.loc[x.index, '_w'] / short_leg.loc[x.index, '_w'].sum())))
+
+    try:
+        to = turnover(returns_df, weights_df)
+    except Exception:
+        to = []
+
+    dates_sorted = sorted(gross_hl.index.unique())
+    turnover_series = pd.Series(index=dates_sorted[1:1 + len(to)], data=to[:len(dates_sorted) - 1])
+
+    net_hl = gross_hl.copy()
+    for d in turnover_series.index:
+        net_hl.loc[d] = gross_hl.loc[d] - cost_rate * turnover_series.loc[d]
+
+    return {'gross_hl': gross_hl, 'net_hl': net_hl, 'turnover_by_date': turnover_series}
+
+
+def zscore_composite(df, cols, group_col='date'):
+    """
+    Cross-sectional (per group_col, typically 'date') z-score average across
+    `cols`, i.e. the standard "raw-consensus composite" / "MIC composite"
+    construction used throughout E5/E13.
+    """
+    z = df.groupby(group_col)[cols].transform(lambda x: (x - x.mean()) / x.std(ddof=0))
+    return z.mean(axis=1)
+
+
+def get_best_lambda_from_summary(horizon, tables_dir=None):
+    tables_dir = Path(tables_dir) if tables_dir else REPO_ROOT / 'tables'
+    summary_path = tables_dir / f'{horizon}_r2_analysis_summary.xlsx'
     # Try to read the best lambda from the summary sheet
     try:
         summary = pd.read_excel(summary_path, sheet_name='R2_Summary')
@@ -141,12 +403,19 @@ def turnover(returns, weights):
 
     return turnovers
 
-def get_Xy_cbapm(train_date, input, target, info, config, device, horizon, weight_lambda, embedding_method='none'):
+def get_Xy_cbapm(train_date, input, target, info, config, device, horizon, weight_lambda,
+                  embedding_method='none', checkpoints_dir=None):
+    """checkpoints_dir defaults to REPO_ROOT/'checkpoints' (cwd-independent);
+    pass e.g. REPO_ROOT/'final_checkpoints' to use the frozen paper checkpoints instead."""
+    if checkpoints_dir is None:
+        checkpoints_dir = REPO_ROOT / 'checkpoints'
+    checkpoints_dir = Path(checkpoints_dir)
+
     if embedding_method == 'autoencoder':
-        autoencoder_path = f'../checkpoints/{horizon}_{weight_lambda}/{train_date}_autoencoder_model0.pt'
+        autoencoder_path = str(checkpoints_dir / f'{horizon}_{weight_lambda}' / f'{train_date}_autoencoder_model0.pt')
     else:
         autoencoder_path = None
-    
+
     train_date_dt = pd.to_datetime(train_date)
     valid_date = (train_date_dt + pd.DateOffset(months=6)).strftime('%Y-%m-%d')
     test_date  = (train_date_dt + pd.DateOffset(months=12)).strftime('%Y-%m-%d')
@@ -160,7 +429,7 @@ def get_Xy_cbapm(train_date, input, target, info, config, device, horizon, weigh
         embedding_method=embedding_method,
         model_path=autoencoder_path
     )
-    model_dir = f'../checkpoints/{horizon}_{weight_lambda}/'
+    model_dir = str(checkpoints_dir / f'{horizon}_{weight_lambda}') + '/'
     models = []
     for i in range(config['ensemble']):
         model = ConceptBottleneckModel(
@@ -240,14 +509,14 @@ def generate_ols_latex_table(real_summary, approx_summary, variable_names):
     rsq = [4.97, -0.16, 4.62, 9.12, 71.43, 39.06, 16.18, 35.45, 37.24]
     for i, name in enumerate(variable_names):
         real = {
-            'coef': real_summary['coef'][i],
-            'tval': real_summary['tvalues'][i],
-            'pval': real_summary['pvalues'][i]
+            'coef': real_summary['coef'].iloc[i],
+            'tval': real_summary['tvalues'].iloc[i],
+            'pval': real_summary['pvalues'].iloc[i]
         }
         approx = {
-            'coef': approx_summary['coef'][i],
-            'tval': approx_summary['tvalues'][i],
-            'pval': approx_summary['pvalues'][i]
+            'coef': approx_summary['coef'].iloc[i],
+            'tval': approx_summary['tvalues'].iloc[i],
+            'pval': approx_summary['pvalues'].iloc[i]
         }
         panel_a.append(format_row(name, real, approx, rsq[i]))
 
